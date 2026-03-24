@@ -16,6 +16,10 @@
         </select>
     </div>
     <div class="form-group">
+        <label for="questionScore">分值（每题得分）:</label>
+        <input type="number" id="questionScore" placeholder="例如: 1, 2.5, 3" min="0" step="0.5" value="1">
+    </div>
+    <div class="form-group">
         <button id="addAnswer">添加/更新答案</button>
     </div>
     <div id="answersMessage" class="message" style="display:none;"></div>
@@ -27,6 +31,7 @@
                 <th>题号</th>
                 <th>题型</th>
                 <th>标准答案</th>
+                <th>分值</th>
                 <th>操作</th>
             </tr>
         </thead>

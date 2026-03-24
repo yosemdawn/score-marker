@@ -2,6 +2,7 @@
 interface StandardAnswer {
     content: string;
     type: 'single_choice' | 'fill_in_blank';
+    score?: number; // 可选字段：前端录入的每题分值，未设置时由后端 defaultScoreConfig 兜底
 }
 
 interface StudentAnswer {
@@ -71,7 +72,12 @@ export function gradeStudentAnswers(
         }
 
         if (isCorrect) {
-            score = scoreConfig[qNum] || 0; // Get score from config, default to 0 if not found
+            // 优先使用标准答案中携带的 score 字段（前端录入），否则回退到 scoreConfig（默认配置）
+            if (stdAns.score !== undefined) {
+                score = stdAns.score;
+            } else {
+                score = scoreConfig[qNum] || 0;
+            }
         }
 
         detailedGrading[qNum] = {
