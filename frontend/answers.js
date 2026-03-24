@@ -6,8 +6,12 @@
     const addAnswerButton = document.getElementById("addAnswer");
     const answersMessage = document.getElementById("answersMessage");
     const answersTableBody = document.querySelector("#answersTable tbody");
+    const parseScoreConfigButton = document.getElementById("parseScoreConfig");
+    const scoreDescriptionInput = document.getElementById("scoreDescription");
+    const parseAnswerConfigButton = document.getElementById("parseAnswerConfig");
+    const answerDescriptionInput = document.getElementById("answerDescription");
 
-    let standardAnswers = JSON.parse(localStorage.getItem("standardAnswers")) || {};
+    let standardAnswers = JSON.parse(localStorage.getItem("standardAnswers") || "{}");
 
     function saveAnswers() {
         localStorage.setItem("standardAnswers", JSON.stringify(standardAnswers));
@@ -17,7 +21,6 @@
     function renderAnswers() {
         answersTableBody.innerHTML = "";
 
-        // 按题号排序（数字优先，否则字母序）
         const sortedKeys = Object.keys(standardAnswers).sort((a, b) => {
             const numA = parseFloat(a);
             const numB = parseFloat(b);
@@ -31,9 +34,8 @@
             row.insertCell(0).textContent = qNum;
             row.insertCell(1).textContent = answer.type === "single_choice" ? "单项选择题" : "填空题";
             row.insertCell(2).textContent = answer.content;
-            // 分值列：兼容旧数据（无 score 字段时显示"未设置"）
             const scoreCell = row.insertCell(3);
-            scoreCell.textContent = answer.score !== undefined ? answer.score + " 分" : "未设置";
+            scoreCell.textContent = answer.score !== undefined ? `${answer.score} 分` : "未设置";
             scoreCell.style.color = answer.score !== undefined ? "#333" : "#999";
 
             const actionsCell = row.insertCell(4);
@@ -48,7 +50,6 @@
             actionsCell.appendChild(deleteButton);
         }
 
-        // 显示总分统计
         updateTotalScore();
     }
 
@@ -61,7 +62,7 @@
             answersTableBody.closest("table").insertAdjacentElement("afterend", existing);
         }
         const totalQuestions = Object.keys(standardAnswers).length;
-        const totalScore = Object.values(standardAnswers).reduce((sum, a) => sum + (a.score || 0), 0);
+        const totalScore = Object.values(standardAnswers).reduce((sum, answer) => sum + (Number(answer.score) || 0), 0);
         existing.textContent = `共 ${totalQuestions} 题，满分合计：${totalScore} 分`;
     }
 
@@ -71,7 +72,7 @@
         answersMessage.style.display = "block";
         setTimeout(() => {
             answersMessage.style.display = "none";
-        }, 3000);
+        }, 4000);
     }
 
     addAnswerButton.addEventListener("click", () => {
@@ -98,9 +99,29 @@
         questionScoreInput.value = "1";
     });
 
-    // 智能分值解析功能
-    const parseScoreConfigButton = document.getElementById("parseScoreConfig");
-    const scoreDescriptionInput = document.getElementById("scoreDescription");
+    async function postJson(url, payload) {
+        const response = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+        });
+
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(errorData.message || "请求失败");
+        }
+
+        return response.json();
+    }
+
+    function getApiCredentials() {
+        const doubaoApiKey = localStorage.getItem("doubaoApiKey");
+        const doubaoSecretKey = localStorage.getItem("doubaoSecretKey");
+        if (!doubaoApiKey) {
+            throw new Error("请先在系统配置中设置 API Key！");
+        }
+        return { doubaoApiKey, doubaoSecretKey };
+    }
 
     if (parseScoreConfigButton && scoreDescriptionInput) {
         parseScoreConfigButton.addEventListener("click", async () => {
@@ -110,44 +131,30 @@
                 return;
             }
 
-            const doubaoApiKey = localStorage.getItem("doubaoApiKey");
-            const doubaoSecretKey = localStorage.getItem("doubaoSecretKey");
-            if (!doubaoApiKey) {
-                showMessage("请先在系统配置中设置 API Key！", "error");
+            let credentials;
+            try {
+                credentials = getApiCredentials();
+            } catch (error) {
+                showMessage(error.message, "error");
                 return;
             }
 
-            // 禁用按钮，显示加载状态
             parseScoreConfigButton.disabled = true;
-            parseScoreConfigButton.textContent = "⏳ 正在解析...";
+            parseScoreConfigButton.textContent = "正在解析分值...";
 
             try {
-                const response = await fetch("http://localhost:3000/api/parse-score-config", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ text, doubaoApiKey, doubaoSecretKey }),
+                const result = await postJson("http://localhost:3000/api/parse-score-config", {
+                    text,
+                    ...credentials,
                 });
+                const scoreMap = result.scoreMap || {};
 
-                if (!response.ok) {
-                    const errorData = await response.json();
-                    throw new Error(errorData.message || "解析失败");
-                }
-
-                const result = await response.json();
-                const scoreMap = result.scoreMap;
-
-                if (!scoreMap || Object.keys(scoreMap).length === 0) {
-                    showMessage("LLM 未能解析出有效的分值配置，请尝试更清晰的描述。", "error");
-                    return;
-                }
-
-                // 将解析出的分值应用到已录入的标准答案中
                 let updatedCount = 0;
-                let skippedKeys = [];
+                const skippedKeys = [];
                 for (const qNum in scoreMap) {
                     if (standardAnswers[qNum]) {
                         standardAnswers[qNum].score = scoreMap[qNum];
-                        updatedCount++;
+                        updatedCount += 1;
                     } else {
                         skippedKeys.push(qNum);
                     }
@@ -155,26 +162,80 @@
 
                 if (updatedCount > 0) {
                     saveAnswers();
-                    let msg = `✅ 成功更新 ${updatedCount} 道题的分值！`;
+                    let msg = `成功更新 ${updatedCount} 道题的分值！`;
                     if (skippedKeys.length > 0) {
-                        msg += ` （${skippedKeys.length} 个题号未录入答案，已跳过：${skippedKeys.slice(0, 10).join(', ')}${skippedKeys.length > 10 ? '...' : ''}）`;
+                        msg += ` 已跳过 ${skippedKeys.length} 个未录入题号。`;
                     }
                     showMessage(msg, "success");
                 } else {
-                    showMessage("解析出的题号与已录入答案不匹配，请检查题号是否一致。已解析的题号：" + Object.keys(scoreMap).join(', '), "error");
+                    showMessage("解析出的题号与已录入答案不匹配。", "error");
                 }
             } catch (error) {
-                console.error("分值解析失败:", error);
                 showMessage(`解析失败: ${error.message}`, "error");
             } finally {
                 parseScoreConfigButton.disabled = false;
-                parseScoreConfigButton.textContent = "🤖 智能解析并应用";
+                parseScoreConfigButton.textContent = "智能解析并应用分值";
             }
         });
     }
 
-    renderAnswers(); // Initial render
+    if (parseAnswerConfigButton && answerDescriptionInput) {
+        parseAnswerConfigButton.addEventListener("click", async () => {
+            const text = answerDescriptionInput.value.trim();
+            if (!text) {
+                showMessage("请输入标准答案描述！", "error");
+                return;
+            }
+
+            let credentials;
+            try {
+                credentials = getApiCredentials();
+            } catch (error) {
+                showMessage(error.message, "error");
+                return;
+            }
+
+            parseAnswerConfigButton.disabled = true;
+            parseAnswerConfigButton.textContent = "正在解析答案...";
+
+            try {
+                const result = await postJson("http://localhost:3000/api/parse-answer-config", {
+                    text,
+                    ...credentials,
+                });
+                const answersMap = result.answersMap || {};
+                const keys = Object.keys(answersMap);
+                if (keys.length === 0) {
+                    throw new Error("LLM 未解析出有效标准答案。");
+                }
+
+                let createdCount = 0;
+                let updatedCount = 0;
+                keys.forEach((qNum) => {
+                    const parsedAnswer = answersMap[qNum];
+                    const existing = standardAnswers[qNum];
+                    standardAnswers[qNum] = {
+                        content: parsedAnswer.content,
+                        type: parsedAnswer.type,
+                        score: parsedAnswer.score !== undefined ? parsedAnswer.score : existing?.score,
+                    };
+                    if (existing) {
+                        updatedCount += 1;
+                    } else {
+                        createdCount += 1;
+                    }
+                });
+
+                saveAnswers();
+                showMessage(`成功应用标准答案：新增 ${createdCount} 题，更新 ${updatedCount} 题。`, "success");
+            } catch (error) {
+                showMessage(`解析失败: ${error.message}`, "error");
+            } finally {
+                parseAnswerConfigButton.disabled = false;
+                parseAnswerConfigButton.textContent = "智能解析并应用答案";
+            }
+        });
+    }
+
+    renderAnswers();
 })();
-
-
-

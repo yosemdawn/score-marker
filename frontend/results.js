@@ -3,8 +3,12 @@
     const resultsMessage = document.getElementById("resultsMessage");
     const exportCsvButton = document.getElementById("exportCsvButton");
     const refreshResultsButton = document.getElementById("refreshResults");
+    const resultsProgress = document.getElementById("resultsProgress");
 
+    const ACTIVE_TASK_KEY = "activeGradingTask";
+    const RESULTS_KEY = "gradingResults";
     let allGradingResults = [];
+    let pollingTimer = null;
 
     function showMessage(msg, type) {
         resultsMessage.textContent = msg;
@@ -15,43 +19,59 @@
         }, 5000);
     }
 
+    function renderTaskProgress(task) {
+        if (!task) {
+            resultsProgress.style.display = "none";
+            resultsProgress.textContent = "";
+            return;
+        }
+        resultsProgress.style.display = "block";
+        resultsProgress.innerHTML = `批阅任务状态：<strong>${task.status}</strong>，已处理 <strong>${task.processedFiles || 0}</strong> / <strong>${task.totalFiles || 0}</strong>，成功 <strong>${task.successCount || 0}</strong>，失败 <strong>${task.errorCount || 0}</strong>。`;
+    }
+
+    function readResults() {
+        const storedResults = localStorage.getItem(RESULTS_KEY);
+        if (!storedResults) {
+            allGradingResults = [];
+            return [];
+        }
+        try {
+            const parsed = JSON.parse(storedResults);
+            allGradingResults = Array.isArray(parsed) ? parsed : [];
+            return allGradingResults;
+        } catch {
+            allGradingResults = [];
+            return [];
+        }
+    }
+
     function renderResults() {
         gradingResultsContainer.innerHTML = "";
-        const storedResults = localStorage.getItem("gradingResults");
-        console.log("读取localStorage结果:", storedResults); // 调试日志
-
-        if (!storedResults) {
-            showMessage("暂无批阅结果。请先在'答题卡处理'页面上传并批阅答题卡。", "info");
+        const storedResults = readResults();
+        if (storedResults.length === 0) {
+            gradingResultsContainer.innerHTML = "";
+            showMessage("暂无批阅结果。请先在“答题卡处理”页面上传并批阅答题卡。", "info");
             return;
         }
 
-        try {
-            allGradingResults = JSON.parse(storedResults);
-            console.log("解析后的结果:", allGradingResults); // 调试日志
-        } catch (error) {
-            console.error("解析localStorage数据失败:", error);
-            showMessage("数据格式错误，请重新批阅。", "error");
-            return;
-        }
-
-        if (!Array.isArray(allGradingResults) || allGradingResults.length === 0) {
-            showMessage("暂无批阅结果。", "info");
-            return;
-        }
-
-        allGradingResults.forEach(studentResult => {
+        storedResults.forEach((studentResult) => {
             const studentCard = document.createElement("div");
             studentCard.className = "student-card section";
 
-            if (studentResult.error) {
+            if (studentResult.status === "pending" || studentResult.status === "processing") {
+                studentCard.innerHTML = `
+                    <h3>文件: ${studentResult.filename}</h3>
+                    <p>状态：${studentResult.status === "pending" ? "排队中" : "处理中"}</p>
+                `;
+            } else if (studentResult.error) {
                 studentCard.innerHTML = `
                     <h3>文件: ${studentResult.filename}</h3>
                     <p class="incorrect">错误: ${studentResult.error}</p>
                 `;
             } else {
                 let totalScore = 0;
-                let detailHtml =
-                    `<h4>得分详情 <button class="grade-detail-toggle">展开/收起</button></h4>
+                let detailHtml = `
+                    <h4>得分详情 <button class="grade-detail-toggle">展开</button></h4>
                     <div class="grade-detail" style="display:none;">
                 `;
 
@@ -60,42 +80,83 @@
                     totalScore += grade.score;
                     detailHtml += `
                         <p>
-                            题号: ${qNum} | 题型: ${grade.questionType === 'single_choice' ? '选择题' : '填空题'} |
-                            标准答案: ${grade.standardAnswer} | 学生答案: ${grade.studentAnswer || '未作答'} |
-                            是否正确: <span class="${grade.isCorrect ? 'correct' : 'incorrect'}">${grade.isCorrect ? '是' : '否'}</span> |
+                            题号: ${qNum} | 题型: ${grade.questionType === "single_choice" ? "选择题" : "填空题"} |
+                            标准答案: ${grade.standardAnswer} | 学生答案: ${grade.studentAnswer || "未作答"} |
+                            是否正确: <span class="${grade.isCorrect ? "correct" : "incorrect"}">${grade.isCorrect ? "是" : "否"}</span> |
                             得分: ${grade.score}
                         </p>
                     `;
                 }
-                detailHtml += `</div>`;
+                detailHtml += "</div>";
 
                 studentCard.innerHTML = `
-                    <h3>学生: ${studentResult.parsed.name} (文件: ${studentResult.filename})</h3>
+                    <h3>学生: ${studentResult.parsed?.name || "未识别"} (文件: ${studentResult.filename})</h3>
                     <p>总分: <strong>${totalScore}</strong></p>
                     ${detailHtml}
                 `;
             }
+
             gradingResultsContainer.appendChild(studentCard);
         });
 
-        // Add event listeners for toggling details
-        document.querySelectorAll(".grade-detail-toggle").forEach(button => {
+        document.querySelectorAll(".grade-detail-toggle").forEach((button) => {
             button.addEventListener("click", (event) => {
-                const detailDiv = event.target.parentNode.nextElementSibling;
-                if (detailDiv.style.display === "none") {
-                    detailDiv.style.display = "block";
-                    button.textContent = "收起";
-                } else {
-                    detailDiv.style.display = "none";
-                    button.textContent = "展开";
-                }
+                const currentButton = event.currentTarget;
+                const detailDiv = currentButton.parentNode.nextElementSibling;
+                const isHidden = detailDiv.style.display === "none";
+                detailDiv.style.display = isHidden ? "block" : "none";
+                currentButton.textContent = isHidden ? "收起" : "展开";
             });
         });
     }
 
+    function stopPolling() {
+        if (pollingTimer) {
+            clearInterval(pollingTimer);
+            pollingTimer = null;
+        }
+    }
+
+    async function fetchTask(taskId) {
+        try {
+            const response = await fetch(`http://localhost:3000/api/tasks/${taskId}`);
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                throw new Error(errorData.message || "获取任务进度失败");
+            }
+            const task = await response.json();
+            localStorage.setItem(ACTIVE_TASK_KEY, JSON.stringify(task));
+            localStorage.setItem(RESULTS_KEY, JSON.stringify(task.items || []));
+            renderTaskProgress(task);
+            renderResults();
+
+            if (task.status === "completed") {
+                stopPolling();
+                localStorage.removeItem(ACTIVE_TASK_KEY);
+                showMessage("批阅已完成，结果已更新。", "success");
+                renderTaskProgress(null);
+            } else if (task.status === "failed" && task.processedFiles >= task.totalFiles) {
+                stopPolling();
+                localStorage.removeItem(ACTIVE_TASK_KEY);
+                showMessage(task.error || "批阅任务失败。", "error");
+            }
+        } catch (error) {
+            stopPolling();
+            showMessage(`刷新进度失败: ${error.message}`, "error");
+        }
+    }
+
+    function startPolling(taskId) {
+        stopPolling();
+        fetchTask(taskId);
+        pollingTimer = setInterval(() => fetchTask(taskId), 1500);
+    }
+
     exportCsvButton.addEventListener("click", async () => {
-        if (allGradingResults.length === 0) {
-            showMessage("没有可导出的成绩数据。", "error");
+        readResults();
+        const exportableResults = allGradingResults.filter((item) => item.status !== "pending" && item.status !== "processing");
+        if (exportableResults.length === 0) {
+            showMessage("没有可导出的已完成成绩数据。", "error");
             return;
         }
 
@@ -107,10 +168,8 @@
                 headers: {
                     "Content-Type": "application/json",
                 },
-                body: JSON.stringify({ gradingResults: allGradingResults }),
+                body: JSON.stringify({ gradingResults: exportableResults }),
             });
-
-            console.log("导出请求发送成功"); // 添加调试日志
 
             if (!response.ok) {
                 const errorData = await response.json();
@@ -127,23 +186,46 @@
             a.click();
             window.URL.revokeObjectURL(url);
             showMessage("CSV文件已成功导出！", "success");
-
         } catch (error) {
-            console.error("Error exporting CSV:", error);
             showMessage(`CSV导出失败: ${error.message}`, "error");
         }
     });
 
-    // 刷新按钮事件监听器
     if (refreshResultsButton) {
         refreshResultsButton.addEventListener("click", () => {
-            console.log("手动刷新结果...");
+            const storedTask = localStorage.getItem(ACTIVE_TASK_KEY);
+            if (storedTask) {
+                try {
+                    const task = JSON.parse(storedTask);
+                    renderTaskProgress(task);
+                    if (task?.taskId) {
+                        startPolling(task.taskId);
+                        return;
+                    }
+                } catch {
+                    localStorage.removeItem(ACTIVE_TASK_KEY);
+                }
+            }
+            renderTaskProgress(null);
             renderResults();
         });
     }
 
-    renderResults();
+    const storedTask = localStorage.getItem(ACTIVE_TASK_KEY);
+    if (storedTask) {
+        try {
+            const task = JSON.parse(storedTask);
+            renderTaskProgress(task);
+            if (task?.taskId) {
+                startPolling(task.taskId);
+            }
+        } catch {
+            localStorage.removeItem(ACTIVE_TASK_KEY);
+            renderTaskProgress(null);
+            renderResults();
+        }
+    } else {
+        renderTaskProgress(null);
+        renderResults();
+    }
 })();
-
-
-

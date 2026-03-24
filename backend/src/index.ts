@@ -1,24 +1,43 @@
-
 import express from 'express';
 import multer from 'multer';
-import axios from 'axios'; 
+import axios from 'axios';
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
+import { randomUUID } from 'crypto';
 import { gradeStudentAnswers } from './grader';
 
 const app = express();
 const port = 3000;
+const uploadDir = path.join(os.tmpdir(), 'score-marker-uploads');
+const TASK_TTL_MS = 30 * 60 * 1000;
+const IMAGE_LLM_TIMEOUT_MS = 120000;
+const TEXT_LLM_TIMEOUT_MS = 45000;
+
+fs.mkdirSync(uploadDir, { recursive: true });
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-
-// Serve static frontend files
 app.use(express.static(path.join(__dirname, '../../frontend')));
 
-// Multer configuration for file uploads
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = multer({
+    storage: multer.diskStorage({
+        destination: (_req, _file, cb) => cb(null, uploadDir),
+        filename: (_req, file, cb) => cb(null, `${Date.now()}-${randomUUID()}-${file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`),
+    }),
+    limits: {
+        files: 100,
+        fileSize: 15 * 1024 * 1024,
+    },
+    fileFilter: (_req, file, cb) => {
+        if (file.mimetype === 'image/jpeg' || file.mimetype === 'image/png') {
+            cb(null, true);
+            return;
+        }
+        cb(new Error('仅支持 JPG/PNG 图片上传。'));
+    },
+});
 
-// Define interface for LLM response
 interface LLMResponse {
     choices: Array<{
         message: {
@@ -33,9 +52,116 @@ interface ParsedLLMResult {
     error?: string;
 }
 
-// Helper function to call Doubao LLM API
-async function callDoubaoLLM(imageBuffer: Buffer, doubaoApiKey: string, doubaoSecretKey: string): Promise<ParsedLLMResult | { error: string }> {
-    const base64Image = imageBuffer.toString('base64');
+interface StandardAnswer {
+    content: string;
+    type: 'single_choice' | 'fill_in_blank';
+    score?: number;
+}
+
+interface ParsedAnswerConfigItem {
+    content: string;
+    type: 'single_choice' | 'fill_in_blank';
+    score?: number;
+}
+
+interface UploadedTaskFile {
+    filename: string;
+    filePath: string;
+}
+
+interface TaskItem {
+    filename: string;
+    status: 'pending' | 'processing' | 'completed' | 'failed';
+    parsed?: ParsedLLMResult;
+    grading?: ReturnType<typeof gradeStudentAnswers>;
+    error?: string;
+}
+
+interface GradingTask {
+    id: string;
+    status: 'queued' | 'processing' | 'completed' | 'failed';
+    createdAt: number;
+    updatedAt: number;
+    totalFiles: number;
+    processedFiles: number;
+    successCount: number;
+    errorCount: number;
+    items: TaskItem[];
+    error?: string;
+}
+
+const tasks = new Map<string, GradingTask>();
+
+function updateTask(task: GradingTask, updater: () => void) {
+    updater();
+    task.updatedAt = Date.now();
+}
+
+function scheduleTaskCleanup(taskId: string) {
+    setTimeout(() => {
+        tasks.delete(taskId);
+    }, TASK_TTL_MS);
+}
+
+function extractJsonFromContent(content: string) {
+    const candidates: string[] = [];
+    const jsonMatch = content.match(/```json\s*\n([\s\S]*?)\n\s*```/);
+    if (jsonMatch?.[1]) candidates.push(jsonMatch[1]);
+
+    const codeMatch = content.match(/```\s*\n([\s\S]*?)\n\s*```/);
+    if (codeMatch?.[1]) candidates.push(codeMatch[1]);
+
+    candidates.push(content);
+
+    const objectMatch = content.match(/\{[\s\S]*\}/);
+    if (objectMatch?.[0]) candidates.push(objectMatch[0]);
+
+    for (const candidate of candidates) {
+        try {
+            return JSON.parse(candidate);
+        } catch {
+            continue;
+        }
+    }
+
+    throw new Error(`无法解析LLM返回的内容: ${content.substring(0, 500)}...`);
+}
+
+async function callDoubao(prompt: string, doubaoApiKey: string, doubaoSecretKey: string, options?: { imageBase64?: string; timeoutMs?: number }) {
+    const content = options?.imageBase64
+        ? [
+            { type: 'text', text: prompt },
+            { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${options.imageBase64}` } },
+        ]
+        : prompt;
+
+    const response = await axios.post<LLMResponse>(
+        'https://ark.cn-beijing.volces.com/api/v3/chat/completions',
+        {
+            model: 'doubao-seed-2-0-lite-260215',
+            max_completion_tokens: 65535,
+            reasoning_effort: 'medium',
+            messages: [
+                {
+                    role: 'user',
+                    content,
+                },
+            ],
+        },
+        {
+            timeout: options?.timeoutMs ?? TEXT_LLM_TIMEOUT_MS,
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${doubaoApiKey}`,
+                ...(doubaoSecretKey && { 'X-Secret-Key': doubaoSecretKey }),
+            },
+        }
+    );
+
+    return response.data.choices[0]?.message?.content || '';
+}
+
+async function callDoubaoLLMFromFile(filePath: string, doubaoApiKey: string, doubaoSecretKey: string): Promise<ParsedLLMResult | { error: string }> {
     const prompt = `你是一个智能答题卡识别助手。请从提供的答题卡图片中识别学生信息和作答内容。答题卡可能是以下两种类型：
 
 【类型1 - 涂卡式（OMR/光学标记）】：学生通过填涂选项框（●、■）来作答
@@ -53,8 +179,7 @@ async function callDoubaoLLM(imageBuffer: Buffer, doubaoApiKey: string, doubaoSe
   "answers": {
     "1": "A",
     "2": "B",
-    "3": "具体答案文本",
-    ...
+    "3": "具体答案文本"
   }
 }
 
@@ -68,108 +193,18 @@ async function callDoubaoLLM(imageBuffer: Buffer, doubaoApiKey: string, doubaoSe
 7. 只输出JSON对象，不要包含任何markdown标记或解释`;
 
     try {
-        const response = await axios.post<LLMResponse>(
-            'https://ark.cn-beijing.volces.com/api/v3/chat/completions',
-            {
-                model: 'doubao-seed-2-0-lite-260215',
-                max_completion_tokens: 65535,
-                reasoning_effort: 'medium',
-                messages: [
-                    {
-                        role: 'user',
-                        content: [
-                            { type: 'text', text: prompt },
-                            { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64Image}` } }
-                        ],
-                    },
-                ],
-            },
-            {
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${doubaoApiKey}`,
-                    ...(doubaoSecretKey && { 'X-Secret-Key': doubaoSecretKey }),
-                },
-            }
-        );
-        const content = response.data.choices[0].message.content;
-        
-        // 添加详细的调试日志
-        console.log('=== LLM 原始返回内容 ===');
-        console.log(content);
-        console.log('=== 内容长度 ===');
-        console.log(content.length);
-        console.log('=== 开始解析 ===');
-        
-        // 尝试多种解析方式
-        let parsedResult = null;
-        
-        // 方式1: 尝试解析 ```json 包装的内容
-        const jsonMatch = content.match(/```json\s*\n([\s\S]*?)\n\s*```/);
-        if (jsonMatch && jsonMatch[1]) {
-            console.log('找到 ```json 包装的内容:', jsonMatch[1]);
-            try {
-                parsedResult = JSON.parse(jsonMatch[1]);
-                console.log('成功解析 ```json 包装的内容');
-            } catch (e) {
-                console.log('解析 ```json 包装的内容失败:', e instanceof Error ? e.message : String(e));
-            }
-        }
-        
-        // 方式2: 尝试解析 ``` 包装的内容
-        if (!parsedResult) {
-            const codeMatch = content.match(/```\s*\n([\s\S]*?)\n\s*```/);
-            if (codeMatch && codeMatch[1]) {
-                console.log('找到 ``` 包装的内容:', codeMatch[1]);
-                try {
-                    parsedResult = JSON.parse(codeMatch[1]);
-                    console.log('成功解析 ``` 包装的内容');
-                } catch (e) {
-                    console.log('解析 ``` 包装的内容失败:', e instanceof Error ? e.message : String(e));
-                }
-            }
-        }
-        
-        // 方式3: 尝试直接解析整个内容
-        if (!parsedResult) {
-            console.log('尝试直接解析整个内容');
-            try {
-                parsedResult = JSON.parse(content);
-                console.log('成功直接解析整个内容');
-            } catch (e) {
-                console.log('直接解析整个内容失败:', e instanceof Error ? e.message : String(e));
-            }
-        }
-        
-        // 方式4: 尝试提取JSON对象
-        if (!parsedResult) {
-            const jsonObjectMatch = content.match(/\{[\s\S]*\}/);
-            if (jsonObjectMatch) {
-                console.log('找到JSON对象:', jsonObjectMatch[0]);
-                try {
-                    parsedResult = JSON.parse(jsonObjectMatch[0]);
-                    console.log('成功解析JSON对象');
-                } catch (e) {
-                    console.log('解析JSON对象失败:', e instanceof Error ? e.message : String(e));
-                }
-            }
-        }
-        
-        if (parsedResult) {
-            console.log('=== 最终解析结果 ===');
-            console.log(JSON.stringify(parsedResult, null, 2));
-            return parsedResult;
-        } else {
-            console.log('=== 所有解析方式都失败了 ===');
-            throw new Error(`无法解析LLM返回的内容: ${content.substring(0, 500)}...`);
-        }
-    } catch (error: unknown) { 
+        const imageBuffer = await fs.promises.readFile(filePath);
+        const content = await callDoubao(prompt, doubaoApiKey, doubaoSecretKey, {
+            imageBase64: imageBuffer.toString('base64'),
+            timeoutMs: IMAGE_LLM_TIMEOUT_MS,
+        });
+        const parsedResult = extractJsonFromContent(content);
+        return parsedResult;
+    } catch (error: unknown) {
         console.error('Error calling Doubao LLM:', error);
-        // Check if it's an AxiosError by duck-typing
         if (typeof error === 'object' && error !== null && 'isAxiosError' in error && (error as any).isAxiosError && 'response' in error) {
             const axiosError = error as any;
-            console.error('Doubao LLM API Error Response:', axiosError.response.data);
-            return { error: `LLM API Error: ${JSON.stringify(axiosError.response.data)}` };
+            return { error: `LLM API Error: ${JSON.stringify(axiosError.response?.data || {})}` };
         }
         if (error instanceof Error) {
             return { error: `LLM调用失败: ${error.message}` };
@@ -178,87 +213,168 @@ async function callDoubaoLLM(imageBuffer: Buffer, doubaoApiKey: string, doubaoSe
     }
 }
 
-// POST /api/process endpoint
-app.post('/api/process', upload.array('files'), async (req, res) => {
-    const files = req.files as Express.Multer.File[];
-    const doubaoApiKey = req.body.doubaoApiKey || process.env.DOUBAO_API_KEY;
-    const doubaoSecretKey = req.body.doubaoSecretKey || process.env.DOUBAO_SECRET_KEY;
+function normalizeParsedStudentResult(parsedResult: any): ParsedLLMResult | { error: string } {
+    let name = parsedResult?.name || '';
+    let answers = parsedResult?.answers || {};
 
-    if (!doubaoApiKey) {
-        return res.status(400).json({ message: 'Doubao API Key is required.' });
+    if (!name) {
+        name = parsedResult?.student_name || parsedResult?.studentName || parsedResult?.姓名 || parsedResult?.学生姓名 || '未识别';
     }
 
-    const results = [];
-    const standardAnswers = JSON.parse(req.body.standardAnswers || "{}");
+    if (!answers || typeof answers !== 'object' || Object.keys(answers).length === 0) {
+        answers = parsedResult?.student_answers || parsedResult?.studentAnswers || parsedResult?.答案 || parsedResult?.学生答案 || {};
+    }
 
-    for (const file of files) {
-        const filename = file.originalname;
+    if (!answers || typeof answers !== 'object' || Object.keys(answers).length === 0) {
+        return { error: `LLM返回结果格式不正确。原始内容: ${JSON.stringify(parsedResult)}` };
+    }
+
+    const normalizedAnswers: Record<string, string> = {};
+    for (const [key, value] of Object.entries(answers)) {
+        if (value !== undefined && value !== null) {
+            normalizedAnswers[String(key)] = String(value).trim();
+        }
+    }
+
+    return { name, answers: normalizedAnswers };
+}
+
+function snapshotTask(task: GradingTask) {
+    return {
+        taskId: task.id,
+        status: task.status,
+        createdAt: task.createdAt,
+        updatedAt: task.updatedAt,
+        totalFiles: task.totalFiles,
+        processedFiles: task.processedFiles,
+        successCount: task.successCount,
+        errorCount: task.errorCount,
+        items: task.items,
+        error: task.error,
+    };
+}
+
+async function processTask(task: GradingTask, files: UploadedTaskFile[], standardAnswers: Record<string, StandardAnswer>, doubaoApiKey: string, doubaoSecretKey: string) {
+    updateTask(task, () => {
+        task.status = 'processing';
+    });
+
+    for (let index = 0; index < files.length; index++) {
+        const file = files[index];
+        updateTask(task, () => {
+            task.items[index].status = 'processing';
+        });
+
         try {
-            const llmResult = await callDoubaoLLM(file.buffer, doubaoApiKey, doubaoSecretKey);
-            if (llmResult.error) {
-                results.push({ filename, error: llmResult.error });
+            const llmResult = await callDoubaoLLMFromFile(file.filePath, doubaoApiKey, doubaoSecretKey);
+            if ('error' in llmResult && llmResult.error) {
+                updateTask(task, () => {
+                    task.items[index].status = 'failed';
+                    task.items[index].error = llmResult.error;
+                    task.errorCount += 1;
+                    task.processedFiles += 1;
+                });
             } else {
-                // 改进的验证逻辑
-                const parsedResult = llmResult as ParsedLLMResult;
-                
-                console.log('=== 验证解析结果 ===');
-                console.log('姓名字段:', parsedResult.name);
-                console.log('答案字段:', parsedResult.answers);
-                console.log('所有字段:', Object.keys(parsedResult));
-                
-                // 更宽松的验证逻辑
-                let name = parsedResult.name || '';
-                let answers = parsedResult.answers || {};
-                
-                // 尝试从其他可能的字段名获取数据
-                if (!name) {
-                    name = (parsedResult as any).student_name ||
-                           (parsedResult as any).studentName ||
-                           (parsedResult as any).姓名 ||
-                           (parsedResult as any).学生姓名 ||
-                           '未识别';
-                }
-                
-                if (!answers || Object.keys(answers).length === 0) {
-                    answers = (parsedResult as any).student_answers ||
-                             (parsedResult as any).studentAnswers ||
-                             (parsedResult as any).答案 ||
-                             (parsedResult as any).学生答案 ||
-                             {};
-                }
-                
-                console.log('=== 处理后的数据 ===');
-                console.log('最终姓名:', name);
-                console.log('最终答案:', answers);
-                
-                // 如果至少有答案数据，就继续处理
-                if (Object.keys(answers).length > 0) {
-                    const finalResult = { name, answers };
-                    const grading = gradeStudentAnswers(finalResult.answers, standardAnswers);
-                    results.push({ filename, parsed: finalResult, grading });
-                    console.log('成功处理文件:', filename);
+                const normalized = normalizeParsedStudentResult(llmResult);
+                if ('error' in normalized) {
+                    updateTask(task, () => {
+                        task.items[index].status = 'failed';
+                        task.items[index].error = normalized.error;
+                        task.errorCount += 1;
+                        task.processedFiles += 1;
+                    });
                 } else {
-                    const errorMsg = `LLM返回结果格式不正确。原始内容: ${JSON.stringify(parsedResult)}`;
-                    console.log('处理失败:', errorMsg);
-                    results.push({ filename, error: errorMsg });
+                    const grading = gradeStudentAnswers(normalized.answers, standardAnswers);
+                    updateTask(task, () => {
+                        task.items[index].status = 'completed';
+                        task.items[index].parsed = normalized;
+                        task.items[index].grading = grading;
+                        task.successCount += 1;
+                        task.processedFiles += 1;
+                    });
                 }
             }
         } catch (error: unknown) {
-            console.error(`Error processing file ${filename}:`, error);
-            if (error instanceof Error) {
-                results.push({ filename, error: `处理文件失败: ${error.message}` });
-            } else {
-                results.push({ filename, error: '处理文件失败: 未知错误' });
-            }
+            updateTask(task, () => {
+                task.items[index].status = 'failed';
+                task.items[index].error = error instanceof Error ? `处理文件失败: ${error.message}` : '处理文件失败: 未知错误';
+                task.errorCount += 1;
+                task.processedFiles += 1;
+            });
+        } finally {
+            fs.promises.unlink(file.filePath).catch(() => undefined);
         }
     }
-    res.json({ items: results });
+
+    updateTask(task, () => {
+        task.status = task.errorCount === task.totalFiles ? 'failed' : 'completed';
+        if (task.status === 'failed' && !task.error) {
+            task.error = '所有文件均处理失败。';
+        }
+    });
+
+    scheduleTaskCleanup(task.id);
+}
+
+app.post('/api/process', upload.array('files'), async (req, res) => {
+    try {
+        const files = (req.files as Express.Multer.File[]) || [];
+        const doubaoApiKey = req.body.doubaoApiKey || process.env.DOUBAO_API_KEY;
+        const doubaoSecretKey = req.body.doubaoSecretKey || process.env.DOUBAO_SECRET_KEY || '';
+
+        if (!doubaoApiKey) {
+            files.forEach(file => fs.promises.unlink(file.path).catch(() => undefined));
+            return res.status(400).json({ message: 'Doubao API Key is required.' });
+        }
+
+        if (files.length === 0) {
+            return res.status(400).json({ message: '请先上传至少一张答题卡图片。' });
+        }
+
+        let standardAnswers: Record<string, StandardAnswer> = {};
+        try {
+            standardAnswers = JSON.parse(req.body.standardAnswers || '{}');
+        } catch {
+            files.forEach(file => fs.promises.unlink(file.path).catch(() => undefined));
+            return res.status(400).json({ message: '标准答案数据格式不正确。' });
+        }
+
+        const taskId = `task_${Date.now()}_${randomUUID()}`;
+        const uploadedFiles = files.map(file => ({ filename: file.originalname, filePath: file.path }));
+        const task: GradingTask = {
+            id: taskId,
+            status: 'queued',
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            totalFiles: uploadedFiles.length,
+            processedFiles: 0,
+            successCount: 0,
+            errorCount: 0,
+            items: uploadedFiles.map(file => ({ filename: file.filename, status: 'pending' })),
+        };
+
+        tasks.set(taskId, task);
+        void processTask(task, uploadedFiles, standardAnswers, doubaoApiKey, doubaoSecretKey);
+
+        res.json({ taskId, status: task.status, totalFiles: task.totalFiles });
+    } catch (error) {
+        const uploadedFiles = (req.files as Express.Multer.File[]) || [];
+        uploadedFiles.forEach(file => fs.promises.unlink(file.path).catch(() => undefined));
+        const message = error instanceof Error ? error.message : '创建批阅任务失败';
+        res.status(500).json({ message });
+    }
 });
 
-// POST /api/parse-score-config endpoint
-// 调用 LLM 将自然语言分值描述解析为结构化的 scoreMap
+app.get('/api/tasks/:taskId', (req, res) => {
+    const task = tasks.get(req.params.taskId);
+    if (!task) {
+        return res.status(404).json({ message: '任务不存在或已过期。' });
+    }
+    res.json(snapshotTask(task));
+});
+
 app.post('/api/parse-score-config', async (req, res) => {
-    const { text, doubaoApiKey, doubaoSecretKey } = req.body;
+    const { text, doubaoApiKey, doubaoSecretKey = '' } = req.body;
 
     if (!text || !text.trim()) {
         return res.status(400).json({ message: '请输入分值描述文本。' });
@@ -280,63 +396,9 @@ app.post('/api/parse-score-config', async (req, res) => {
 用户输入：${text.trim()}`;
 
     try {
-        const response = await axios.post<LLMResponse>(
-            'https://ark.cn-beijing.volces.com/api/v3/chat/completions',
-            {
-                model: 'doubao-seed-2-0-lite-260215',
-                reasoning_effort: 'medium',
-                messages: [
-                    {
-                        role: 'user',
-                        content: prompt,
-                    },
-                ],
-            },
-            {
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${doubaoApiKey}`,
-                    ...(doubaoSecretKey && { 'X-Secret-Key': doubaoSecretKey }),
-                },
-            }
-        );
-
-        const content = response.data.choices[0].message.content;
-        console.log('=== 分值解析 LLM 原始返回 ===');
-        console.log(content);
-
-        // 多种方式尝试解析JSON
-        let scoreMap = null;
-
-        // 方式1: ```json 包装
-        const jsonMatch = content.match(/```json\s*\n([\s\S]*?)\n\s*```/);
-        if (jsonMatch && jsonMatch[1]) {
-            try { scoreMap = JSON.parse(jsonMatch[1]); } catch (e) {}
-        }
-
-        // 方式2: ``` 包装
-        if (!scoreMap) {
-            const codeMatch = content.match(/```\s*\n([\s\S]*?)\n\s*```/);
-            if (codeMatch && codeMatch[1]) {
-                try { scoreMap = JSON.parse(codeMatch[1]); } catch (e) {}
-            }
-        }
-
-        // 方式3: 直接解析
-        if (!scoreMap) {
-            try { scoreMap = JSON.parse(content); } catch (e) {}
-        }
-
-        // 方式4: 提取JSON对象
-        if (!scoreMap) {
-            const objMatch = content.match(/\{[\s\S]*\}/);
-            if (objMatch) {
-                try { scoreMap = JSON.parse(objMatch[0]); } catch (e) {}
-            }
-        }
-
+        const content = await callDoubao(prompt, doubaoApiKey, doubaoSecretKey, { timeoutMs: TEXT_LLM_TIMEOUT_MS });
+        const scoreMap = extractJsonFromContent(content);
         if (scoreMap && typeof scoreMap === 'object') {
-            // 验证所有 value 都是数字
             const validated: { [key: string]: number } = {};
             for (const key in scoreMap) {
                 const val = Number(scoreMap[key]);
@@ -344,17 +406,14 @@ app.post('/api/parse-score-config', async (req, res) => {
                     validated[key] = val;
                 }
             }
-            console.log('=== 解析后的分值配置 ===');
-            console.log(JSON.stringify(validated, null, 2));
-            res.json({ scoreMap: validated });
-        } else {
-            res.status(500).json({ message: '无法从LLM返回中解析分值配置，请尝试更清晰的描述。' });
+            return res.json({ scoreMap: validated });
         }
+        return res.status(500).json({ message: '无法从LLM返回中解析分值配置，请尝试更清晰的描述。' });
     } catch (error: unknown) {
         console.error('分值解析LLM调用失败:', error);
         if (typeof error === 'object' && error !== null && 'isAxiosError' in error && (error as any).isAxiosError && 'response' in error) {
             const axiosError = error as any;
-            return res.status(500).json({ message: `LLM API Error: ${JSON.stringify(axiosError.response.data)}` });
+            return res.status(500).json({ message: `LLM API Error: ${JSON.stringify(axiosError.response?.data || {})}` });
         }
         if (error instanceof Error) {
             return res.status(500).json({ message: `解析失败: ${error.message}` });
@@ -363,7 +422,78 @@ app.post('/api/parse-score-config', async (req, res) => {
     }
 });
 
-// POST /api/export endpoint
+app.post('/api/parse-answer-config', async (req, res) => {
+    const { text, doubaoApiKey, doubaoSecretKey = '' } = req.body;
+
+    if (!text || !text.trim()) {
+        return res.status(400).json({ message: '请输入标准答案描述。' });
+    }
+    if (!doubaoApiKey) {
+        return res.status(400).json({ message: '请先在系统配置中设置 API Key。' });
+    }
+
+    const prompt = `你是一个考试标准答案解析助手。用户会用自然语言描述一批试题的标准答案，请将其解析成一个 JSON 对象。
+
+输出格式要求：
+1. 只输出纯 JSON，不要任何解释或 markdown
+2. 顶层结构必须为：{"题号":{"content":"答案","type":"single_choice或fill_in_blank","score":可选数字}}
+3. 必须把范围展开成逐题结果
+4. 选择题 type 固定为 single_choice，答案通常是大写字母
+5. 填空题 type 固定为 fill_in_blank，答案保留文本原意
+6. 如用户未提到 score，就不要输出 score 字段
+7. 题号必须用字符串作为 key
+
+示例输入：1到3题选择题答案依次为A、B、C，4到5题填空题答案为北京、上海
+示例输出：{"1":{"content":"A","type":"single_choice"},"2":{"content":"B","type":"single_choice"},"3":{"content":"C","type":"single_choice"},"4":{"content":"北京","type":"fill_in_blank"},"5":{"content":"上海","type":"fill_in_blank"}}
+
+用户输入：${text.trim()}`;
+
+    try {
+        const content = await callDoubao(prompt, doubaoApiKey, doubaoSecretKey, { timeoutMs: TEXT_LLM_TIMEOUT_MS });
+        const answersMap = extractJsonFromContent(content);
+        if (!answersMap || typeof answersMap !== 'object') {
+            return res.status(500).json({ message: '无法从LLM返回中解析标准答案配置，请尝试更清晰的描述。' });
+        }
+
+        const validated: Record<string, ParsedAnswerConfigItem> = {};
+        for (const [key, rawValue] of Object.entries(answersMap)) {
+            if (!rawValue || typeof rawValue !== 'object') continue;
+            const item = rawValue as Record<string, unknown>;
+            const contentValue = typeof item.content === 'string' ? item.content.trim() : '';
+            const typeValue = item.type === 'single_choice' || item.type === 'fill_in_blank' ? item.type : undefined;
+            if (!contentValue || !typeValue) continue;
+
+            const normalized: ParsedAnswerConfigItem = {
+                content: contentValue,
+                type: typeValue,
+            };
+
+            const numericScore = Number(item.score);
+            if (!isNaN(numericScore)) {
+                normalized.score = numericScore;
+            }
+
+            validated[String(key)] = normalized;
+        }
+
+        if (Object.keys(validated).length === 0) {
+            return res.status(500).json({ message: 'LLM 未能解析出有效的标准答案配置，请尝试更清晰的描述。' });
+        }
+
+        return res.json({ answersMap: validated });
+    } catch (error: unknown) {
+        console.error('标准答案解析LLM调用失败:', error);
+        if (typeof error === 'object' && error !== null && 'isAxiosError' in error && (error as any).isAxiosError && 'response' in error) {
+            const axiosError = error as any;
+            return res.status(500).json({ message: `LLM API Error: ${JSON.stringify(axiosError.response?.data || {})}` });
+        }
+        if (error instanceof Error) {
+            return res.status(500).json({ message: `解析失败: ${error.message}` });
+        }
+        return res.status(500).json({ message: '解析失败: 未知错误' });
+    }
+});
+
 app.post('/api/export', (req, res) => {
     const gradingResults = req.body.gradingResults;
 
@@ -371,11 +501,10 @@ app.post('/api/export', (req, res) => {
         return res.status(400).json({ message: 'No grading results provided for export.' });
     }
 
-    let csvContent = '\ufeff'; // UTF-8 BOM
+    let csvContent = '\ufeff';
     const headers = ['文件名', '学生姓名', '总分'];
     const questionNumbers = new Set<string>();
 
-    // Collect all unique question numbers
     gradingResults.forEach((studentResult: any) => {
         if (studentResult.grading) {
             Object.keys(studentResult.grading).forEach(qNum => questionNumbers.add(qNum));
@@ -383,9 +512,8 @@ app.post('/api/export', (req, res) => {
     });
 
     const sortedQuestionNumbers = Array.from(questionNumbers).sort((a, b) => {
-        // Try to sort numerically if possible, otherwise alphabetically
-        const numA = parseInt(a);
-        const numB = parseInt(b);
+        const numA = parseInt(a, 10);
+        const numB = parseInt(b, 10);
         if (!isNaN(numA) && !isNaN(numB)) {
             return numA - numB;
         }
@@ -409,7 +537,7 @@ app.post('/api/export', (req, res) => {
 
         const row: (string | number)[] = [];
         row.push(studentResult.filename);
-        row.push(studentResult.parsed.name || '');
+        row.push(studentResult.parsed?.name || '');
 
         let totalScore = 0;
         if (studentResult.grading) {
@@ -434,9 +562,6 @@ app.post('/api/export', (req, res) => {
     res.send(csvContent);
 });
 
-// Start the server
 app.listen(port, () => {
     console.log(`Server running at http://localhost:${port}`);
 });
-
-
