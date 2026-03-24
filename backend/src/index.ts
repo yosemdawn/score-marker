@@ -42,7 +42,7 @@ async function callDoubaoLLM(imageBuffer: Buffer, doubaoApiKey: string, doubaoSe
         const response = await axios.post<LLMResponse>(
             'https://ark.cn-beijing.volces.com/api/v3/chat/completions',
             {
-                model: 'doubao-seed-1-6-251015',
+                model: 'doubao-seed-2-0-lite-260215',
                 max_completion_tokens: 65535,
                 reasoning_effort: 'medium',
                 messages: [
@@ -224,6 +224,114 @@ app.post('/api/process', upload.array('files'), async (req, res) => {
         }
     }
     res.json({ items: results });
+});
+
+// POST /api/parse-score-config endpoint
+// 调用 LLM 将自然语言分值描述解析为结构化的 scoreMap
+app.post('/api/parse-score-config', async (req, res) => {
+    const { text, doubaoApiKey, doubaoSecretKey } = req.body;
+
+    if (!text || !text.trim()) {
+        return res.status(400).json({ message: '请输入分值描述文本。' });
+    }
+    if (!doubaoApiKey) {
+        return res.status(400).json({ message: '请先在系统配置中设置 API Key。' });
+    }
+
+    const prompt = `你是一个考试分值解析助手。用户会用自然语言描述试题的分值分配规则，请将其解析为一个JSON对象，其中key为题号（字符串），value为该题的分值（数字）。
+
+重要规则：
+1. 必须将范围展开为每一道题。例如"1-5题每题2分"要展开为 {"1":2,"2":2,"3":2,"4":2,"5":2}
+2. 只输出纯JSON对象，不要包含任何解释、注释或markdown格式
+3. 题号必须是字符串，分值必须是数字（支持小数如2.5）
+
+示例输入：1到3题每题2分，4到5题每题3.5分
+示例输出：{"1":2,"2":2,"3":2,"4":3.5,"5":3.5}
+
+用户输入：${text.trim()}`;
+
+    try {
+        const response = await axios.post<LLMResponse>(
+            'https://ark.cn-beijing.volces.com/api/v3/chat/completions',
+            {
+                model: 'doubao-seed-2-0-lite-260215',
+                reasoning_effort: 'medium',
+                messages: [
+                    {
+                        role: 'user',
+                        content: prompt,
+                    },
+                ],
+            },
+            {
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${doubaoApiKey}`,
+                    ...(doubaoSecretKey && { 'X-Secret-Key': doubaoSecretKey }),
+                },
+            }
+        );
+
+        const content = response.data.choices[0].message.content;
+        console.log('=== 分值解析 LLM 原始返回 ===');
+        console.log(content);
+
+        // 多种方式尝试解析JSON
+        let scoreMap = null;
+
+        // 方式1: ```json 包装
+        const jsonMatch = content.match(/```json\s*\n([\s\S]*?)\n\s*```/);
+        if (jsonMatch && jsonMatch[1]) {
+            try { scoreMap = JSON.parse(jsonMatch[1]); } catch (e) {}
+        }
+
+        // 方式2: ``` 包装
+        if (!scoreMap) {
+            const codeMatch = content.match(/```\s*\n([\s\S]*?)\n\s*```/);
+            if (codeMatch && codeMatch[1]) {
+                try { scoreMap = JSON.parse(codeMatch[1]); } catch (e) {}
+            }
+        }
+
+        // 方式3: 直接解析
+        if (!scoreMap) {
+            try { scoreMap = JSON.parse(content); } catch (e) {}
+        }
+
+        // 方式4: 提取JSON对象
+        if (!scoreMap) {
+            const objMatch = content.match(/\{[\s\S]*\}/);
+            if (objMatch) {
+                try { scoreMap = JSON.parse(objMatch[0]); } catch (e) {}
+            }
+        }
+
+        if (scoreMap && typeof scoreMap === 'object') {
+            // 验证所有 value 都是数字
+            const validated: { [key: string]: number } = {};
+            for (const key in scoreMap) {
+                const val = Number(scoreMap[key]);
+                if (!isNaN(val)) {
+                    validated[key] = val;
+                }
+            }
+            console.log('=== 解析后的分值配置 ===');
+            console.log(JSON.stringify(validated, null, 2));
+            res.json({ scoreMap: validated });
+        } else {
+            res.status(500).json({ message: '无法从LLM返回中解析分值配置，请尝试更清晰的描述。' });
+        }
+    } catch (error: unknown) {
+        console.error('分值解析LLM调用失败:', error);
+        if (typeof error === 'object' && error !== null && 'isAxiosError' in error && (error as any).isAxiosError && 'response' in error) {
+            const axiosError = error as any;
+            return res.status(500).json({ message: `LLM API Error: ${JSON.stringify(axiosError.response.data)}` });
+        }
+        if (error instanceof Error) {
+            return res.status(500).json({ message: `解析失败: ${error.message}` });
+        }
+        return res.status(500).json({ message: '解析失败: 未知错误' });
+    }
 });
 
 // POST /api/export endpoint

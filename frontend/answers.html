@@ -24,6 +24,18 @@
     </div>
     <div id="answersMessage" class="message" style="display:none;"></div>
 
+    <div class="section" style="margin-top:20px; padding:15px; background:#f0f7ff; border:1px solid #b3d7ff; border-radius:8px;">
+        <h3 style="margin-top:0; color:#0056b3;">🤖 智能分值配置</h3>
+        <div class="form-group">
+            <label for="scoreDescription">用自然语言描述各题分值：</label>
+            <textarea id="scoreDescription" rows="3" style="width:calc(100% - 22px); padding:10px; border:1px solid #ccc; border-radius:4px; font-size:14px; resize:vertical;" placeholder="例如：1到20题每题1分，21到40题每题2.5分，41到55题每题1分"></textarea>
+        </div>
+        <div class="form-group">
+            <button id="parseScoreConfig" style="background-color:#0056b3;">🤖 智能解析并应用</button>
+        </div>
+        <p style="font-size:12px; color:#666; margin:5px 0 0 0;">⚠️ 仅更新已录入题目的分值，不会影响答案内容。未录入的题号将被忽略。</p>
+    </div>
+
     <h3>已录入答案</h3>
     <table id="answersTable">
         <thead>
