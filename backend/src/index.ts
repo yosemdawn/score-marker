@@ -36,7 +36,36 @@ interface ParsedLLMResult {
 // Helper function to call Doubao LLM API
 async function callDoubaoLLM(imageBuffer: Buffer, doubaoApiKey: string, doubaoSecretKey: string): Promise<ParsedLLMResult | { error: string }> {
     const base64Image = imageBuffer.toString('base64');
-    const prompt = `你是一个智能批改助手，请从我提供的答题卡图片中识别学生信息和作答内容。请严格按照以下JSON格式输出结果，不要包含任何额外信息或解释。如果无法识别，请在error字段中说明原因。\n\nJSON格式要求：\n{\n  "name": "学生的姓名",\n  "answers": {\n    "1": "第1题的答案",\n    "2": "第2题的答案",\n    "...": "..."\n  }\n}\n\n请注意：\n1. 提取的姓名应是图片中清晰可见的学生姓名。\n2. 答案应是学生在答题卡上填写的对应题号的答案。对于选择题，通常是单个大写字母；对于填空题，是具体的文本内容。\n3. 如果图片中没有找到有效的姓名或答案，请在相应的字段中留空或返回错误信息。`;
+    const prompt = `你是一个智能答题卡识别助手。请从提供的答题卡图片中识别学生信息和作答内容。答题卡可能是以下两种类型：
+
+【类型1 - 涂卡式（OMR/光学标记）】：学生通过填涂选项框（●、■）来作答
+【类型2 - 手写式】：学生在空白处手写填入具体答案内容
+
+识别规则：
+- 涂卡式：识别被填涂/标记的选项框对应的字母（通常A/B/C/D/E/F中的一个）
+- 手写式：识别学生手写的具体文本内容
+- 填空题：识别填写的文本（数字、单词、中文等）
+- 如果题目既无涂卡标记也无手写内容，视为未作答（空值）
+
+输出格式（JSON，仅输出JSON，不要任何其他文字）：
+{
+  "name": "学生姓名",
+  "answers": {
+    "1": "A",
+    "2": "B",
+    "3": "具体答案文本",
+    ...
+  }
+}
+
+关键要求：
+1. 姓名：从图片中识别清晰可见的学生姓名
+2. 题号与答案必须严格一一对应
+3. 选择题答案通常是单个大写字母（A-F）
+4. 填空题答案是具体的文本/数字内容
+5. 涂卡：识别被填涂的框，返回对应字母
+6. 如无法识别，在error字段说明原因
+7. 只输出JSON对象，不要包含任何markdown标记或解释`;
 
     try {
         const response = await axios.post<LLMResponse>(
