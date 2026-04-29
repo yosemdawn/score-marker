@@ -143,7 +143,7 @@
             parseScoreConfigButton.textContent = "正在解析分值...";
 
             try {
-                const result = await postJson("http://localhost:3000/api/parse-score-config", {
+                const result = await postJson("/api/parse-score-config", {
                     text,
                     ...credentials,
                 });
@@ -199,7 +199,7 @@
             parseAnswerConfigButton.textContent = "正在解析答案...";
 
             try {
-                const result = await postJson("http://localhost:3000/api/parse-answer-config", {
+                const result = await postJson("/api/parse-answer-config", {
                     text,
                     ...credentials,
                 });

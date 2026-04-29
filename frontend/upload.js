@@ -174,7 +174,7 @@
 
     async function pollTask(taskId) {
         try {
-            const response = await fetch(`http://localhost:3000/api/tasks/${taskId}`);
+            const response = await fetch(`/api/tasks/${taskId}`);
             if (!response.ok) {
                 const errorData = await response.json().catch(() => ({}));
                 throw new Error(errorData.message || "获取任务进度失败");
@@ -273,7 +273,7 @@
         formData.append("standardAnswers", standardAnswers);
 
         try {
-            const response = await fetch("http://localhost:3000/api/process", {
+            const response = await fetch("/api/process", {
                 method: "POST",
                 body: formData,
             });

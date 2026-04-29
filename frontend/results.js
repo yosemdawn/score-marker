@@ -119,7 +119,7 @@
 
     async function fetchTask(taskId) {
         try {
-            const response = await fetch(`http://localhost:3000/api/tasks/${taskId}`);
+            const response = await fetch(`/api/tasks/${taskId}`);
             if (!response.ok) {
                 const errorData = await response.json().catch(() => ({}));
                 throw new Error(errorData.message || "获取任务进度失败");
@@ -163,7 +163,7 @@
         showMessage("正在导出CSV文件...", "info");
 
         try {
-            const response = await fetch("http://localhost:3000/api/export", {
+            const response = await fetch("/api/export", {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",

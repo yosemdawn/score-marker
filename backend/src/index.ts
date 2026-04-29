@@ -4,21 +4,49 @@ import axios from 'axios';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+import { exec } from 'child_process';
+import http from 'http';
 import { randomUUID } from 'crypto';
 import { gradeStudentAnswers } from './grader';
 
 const app = express();
-const port = 3000;
+const DEFAULT_PORT = 3000;
 const uploadDir = path.join(os.tmpdir(), 'score-marker-uploads');
 const TASK_TTL_MS = 30 * 60 * 1000;
 const IMAGE_LLM_TIMEOUT_MS = 120000;
 const TEXT_LLM_TIMEOUT_MS = 45000;
+let server: http.Server | null = null;
 
 fs.mkdirSync(uploadDir, { recursive: true });
 
+function resolveFrontendDir() {
+    const candidates = [
+        path.join(__dirname, 'frontend'),
+        path.join(__dirname, '../frontend'),
+        path.join(__dirname, '../../frontend'),
+        path.join(process.cwd(), 'frontend'),
+        path.join(path.dirname(process.execPath), 'frontend'),
+    ];
+
+    for (const candidate of candidates) {
+        if (fs.existsSync(path.join(candidate, 'index.html'))) {
+            return candidate;
+        }
+    }
+
+    throw new Error(`Frontend directory not found. Checked: ${candidates.join(', ')}`);
+}
+
+function openBrowser(url: string) {
+    const encodedUrl = url.replace(/&/g, '^&');
+    exec(`start "" "${encodedUrl}"`);
+}
+
+const frontendDir = resolveFrontendDir();
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use(express.static(path.join(__dirname, '../../frontend')));
+app.use(express.static(frontendDir));
 
 const upload = multer({
     storage: multer.diskStorage({
@@ -562,6 +590,44 @@ app.post('/api/export', (req, res) => {
     res.send(csvContent);
 });
 
-app.listen(port, () => {
-    console.log(`Server running at http://localhost:${port}`);
-});
+export interface StartServerOptions {
+    port?: number;
+    openBrowser?: boolean;
+}
+
+export function startServer(options: StartServerOptions = {}) {
+    if (server) {
+        return server;
+    }
+
+    const port = options.port ?? DEFAULT_PORT;
+    server = app.listen(port, () => {
+        console.log(`Server running at http://localhost:${port}`);
+        if (options.openBrowser ?? process.env.OPEN_BROWSER !== 'false') {
+            openBrowser(`http://localhost:${port}`);
+        }
+    });
+
+    return server;
+}
+
+export function stopServer() {
+    if (!server) {
+        return Promise.resolve();
+    }
+
+    return new Promise<void>((resolve, reject) => {
+        server?.close((error?: Error) => {
+            if (error) {
+                reject(error);
+                return;
+            }
+            server = null;
+            resolve();
+        });
+    });
+}
+
+if (require.main === module) {
+    startServer();
+}
